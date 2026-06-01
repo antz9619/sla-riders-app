@@ -11,6 +11,18 @@ from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.chart import BarChart, LineChart, Reference, PieChart
 from openpyxl.chart.label import DataLabelList
 from openpyxl.chart.series import DataPoint
+import logging
+
+# Configurar logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ============================================================
+# CONSTANTES GLOBALES
+# ============================================================
+CORTE_HORA = pd.Timestamp('1900-01-01 16:30:00').time()
+DIAS_LIMITE = 3
+MAX_CELLS_STYLED = 262144
 
 
 # ============================================================
@@ -262,7 +274,7 @@ def escribir_hoja_evolucion(writer, sla_global, evo_zonas, sla_semanal=None):
 # 4. FUNCIÓN PRINCIPAL DE PROCESAMIENTO (CACHEADA) - LÓGICA CORREGIDA
 # ============================================================
 @st.cache_data(show_spinner=False)
-def procesar_datos(riders_bytes, riders_filename, zonas_bytes, zonas_filename):
+def procesar_datos(riders_bytes, zonas_bytes):
     """
     Lee ambos archivos, cruza, excluye, calcula días hábiles e incumplimiento.
     Retorna (df, total_original, excluidas, total_encontradas).
@@ -270,8 +282,23 @@ def procesar_datos(riders_bytes, riders_filename, zonas_bytes, zonas_filename):
     🔧 LÓGICA CORREGIDA: 
     - Órdenes ≤16:30: SLA de 3 días hábiles desde fecha de creación
     - Órdenes >16:30: SLA de 3 días hábiles desde el SIGUIENTE día hábil
+    
+    🔧 OPTIMIZACIÓN: Se eliminaron parámetros innecesarios del caché (filenames)
     """
-    df = pd.read_excel(io.BytesIO(riders_bytes), engine='openpyxl')
+    try:
+        df = pd.read_excel(io.BytesIO(riders_bytes), engine='openpyxl')
+    except Exception as e:
+        logger.error(f"Error al leer archivo Riders: {e}")
+        st.error(f"❌ Error al leer el archivo de Riders: {str(e)}. Verificá que sea un Excel válido.")
+        raise
+    
+    # Validar columnas requeridas
+    columnas_requeridas = ['NumeroGuia', 'FechaCreacionWMS', 'FechaEsperandoRetiro', 'CodigoOrden']
+    columnas_faltantes = [col for col in columnas_requeridas if col not in df.columns]
+    if columnas_faltantes:
+        st.error(f"❌ El archivo de Riders debe tener las columnas: {', '.join(columnas_faltantes)}")
+        raise ValueError(f"Columnas faltantes en Riders: {columnas_faltantes}")
+    
     df['NumeroGuia'] = df['NumeroGuia'].apply(pad_guia)
     df['FechaCreacionWMS'] = pd.to_datetime(df['FechaCreacionWMS'], errors='coerce')
     df['FechaEsperandoRetiro'] = pd.to_datetime(df['FechaEsperandoRetiro'], errors='coerce')
@@ -283,10 +310,20 @@ def procesar_datos(riders_bytes, riders_filename, zonas_bytes, zonas_filename):
     excluidas = 0
     total_encontradas = 0
     if zonas_bytes is not None:
-        if zonas_filename.endswith('.csv'):
-            df_zonas = pd.read_csv(io.BytesIO(zonas_bytes))
-        else:
-            df_zonas = pd.read_excel(io.BytesIO(zonas_bytes), engine='openpyxl')
+        try:
+            if isinstance(zonas_bytes, bytes):
+                # Intentar detectar formato por contenido
+                if zonas_bytes[:2] == b'PK':  # Excel
+                    df_zonas = pd.read_excel(io.BytesIO(zonas_bytes), engine='openpyxl')
+                else:  # CSV
+                    df_zonas = pd.read_csv(io.BytesIO(zonas_bytes))
+            else:
+                st.error("❌ El archivo de zonas tiene un formato inválido.")
+                raise ValueError("Formato de archivo de zonas inválido")
+        except Exception as e:
+            logger.error(f"Error al leer archivo de Zonas: {e}")
+            st.error(f"❌ Error al leer el archivo de Zonas: {str(e)}. Verificá que sea un Excel o CSV válido.")
+            raise
 
         col_guia = None
         if 'NumeroGuia' in df_zonas.columns:
@@ -339,10 +376,9 @@ def procesar_datos(riders_bytes, riders_filename, zonas_bytes, zonas_filename):
     # ============================================================
     
     # Días límite: SIEMPRE 3 días hábiles (el inicio del cómputo varía)
-    df['dias_limite'] = 3
+    df['dias_limite'] = DIAS_LIMITE
     
-    # Hora de corte
-    corte_hora = pd.Timestamp('1900-01-01 16:30:00').time()
+    # Hora de corte (usando constante global)
     df['hora_creacion'] = df['FechaCreacionWMS'].dt.time
     
     # Cálculo vectorizado de feriados
@@ -357,8 +393,9 @@ def procesar_datos(riders_bytes, riders_filename, zonas_bytes, zonas_filename):
     # 🔹 Determinar fecha de inicio del cómputo del SLA
     # Si orden ≤ 16:30: inicio = fecha de creación
     # Si orden > 16:30: inicio = siguiente día hábil (usando busday_offset)
-    despues_del_corte = df['hora_creacion'] > corte_hora
+    despues_del_corte = df['hora_creacion'] > CORTE_HORA
     
+    # Validación edge-case: si la fecha de inicio cae en feriado+finde, roll='forward' busca el próximo hábil
     fecha_inicio_sla = np.where(
         despues_del_corte,
         np.busday_offset(fechas_creacion_np, 1, holidays=feriados_np, roll='forward'),  # siguiente hábil
@@ -376,13 +413,13 @@ def procesar_datos(riders_bytes, riders_filename, zonas_bytes, zonas_filename):
     # ============================================================
     def motivo_incumplimiento(row):
         dias = row['dias_habiles']
-        limite = row['dias_limite']  # siempre 3
+        limite = row['dias_limite']  # siempre DIAS_LIMITE
         creacion = row['FechaCreacionWMS']
         listo = row['FechaEsperandoRetiro']
         hora = row['hora_creacion']
         
-        # Determinar si el SLA comenzó al día siguiente
-        if hora <= corte_hora:
+        # Determinar si el SLA comenzó al día siguiente (usando constante global)
+        if hora <= CORTE_HORA:
             inicio_sla = creacion.date()
             texto_inicio = f"desde creación ({creacion.date()})"
         else:
@@ -423,15 +460,17 @@ archivo_riders = st.file_uploader("📂 Subí el archivo Excel", type=["xlsx"])
 archivo_zonas = st.file_uploader("📂 (Opcional) Subí el archivo con ZONA, Destinatario y Semana", type=["xlsx", "csv"])
 
 if archivo_riders is not None:
-    # Convertir a bytes para cachear
+    # Convertir a bytes para cachear (sin filenames para optimizar caché)
     riders_bytes = archivo_riders.read()
     zonas_bytes = archivo_zonas.read() if archivo_zonas else None
-    zonas_filename = archivo_zonas.name if archivo_zonas else ""
 
     # Procesamiento cacheado (se ejecuta una vez al cargar el archivo)
-    df, total_original, excluidas, total_encontradas = procesar_datos(
-        riders_bytes, archivo_riders.name, zonas_bytes, zonas_filename
-    )
+    try:
+        df, total_original, excluidas, total_encontradas = procesar_datos(
+            riders_bytes, zonas_bytes
+        )
+    except Exception as e:
+        st.stop()  # Detener ejecución si hay error crítico
 
     # Mensaje de exclusión (sin duplicar el de ZONA)
     if archivo_zonas:
@@ -489,17 +528,24 @@ if archivo_riders is not None:
         submitted = st.form_submit_button("🔍 Aplicar filtros", type="primary")
 
     # 🔹 Si se presionó el botón, aplicar filtros; sino, usar valores por defecto
+    # 🔧 CORRECCIÓN: Los filtros SIEMPRE se aplican (con valores por defecto o del formulario)
+    # El mensaje de "filtros aplicados" ahora es consistente con el estado real
+    fecha_desde = fecha_desde_input if submitted else fecha_min
+    fecha_hasta = fecha_hasta_input if submitted else fecha_max
+    zona_sel = zona_sel_input if submitted else 'Todas'
+    solo_incumplimientos = solo_incumplimientos_input if submitted else False
+    
+    # 🔧 CORRECCIÓN: Mensaje de filtros siempre visible para consistencia
+    filtros_aplicados_msg = []
     if submitted:
-        fecha_desde = fecha_desde_input
-        fecha_hasta = fecha_hasta_input
-        zona_sel = zona_sel_input
-        solo_incumplimientos = solo_incumplimientos_input
+        filtros_aplicados_msg.append("🔍 Filtros personalizados aplicados")
     else:
-        # Valores por defecto si no se aplicaron filtros aún
-        fecha_desde = fecha_min
-        fecha_hasta = fecha_max
-        zona_sel = 'Todas'
-        solo_incumplimientos = False
+        filtros_aplicados_msg.append("📊 Mostrando todos los datos (filtros por defecto)")
+    
+    if zona_sel != 'Todas':
+        filtros_aplicados_msg.append(f"Zona: {zona_sel}")
+    if solo_incumplimientos:
+        filtros_aplicados_msg.append("Solo incumplimientos")
 
     # 🔹 Construir máscara de filtros
     mascara = pd.Series(True, index=df.index)
@@ -513,15 +559,18 @@ if archivo_riders is not None:
 
     df_filtrado = df[mascara]   # copia solo las filas filtradas
 
-    # Mostrar resumen de filtros aplicados
+    # Mostrar resumen de filtros aplicados (siempre visible para consistencia)
     st.sidebar.markdown("---")
     st.sidebar.markdown(f"**{len(df_filtrado):,}** pedidos con filtros aplicados")
-    if submitted:
-        st.sidebar.caption(f"📅 {fecha_desde} → {fecha_hasta} | 📍 {zona_sel} | {'🚫 Solo incumplimientos' if solo_incumplimientos else '✅ Todos'}")
+    st.sidebar.caption(f"📅 {fecha_desde} → {fecha_hasta} | 📍 {zona_sel} | {'🚫 Solo incumplimientos' if solo_incumplimientos else '✅ Todos'}")
+    
+    # 🔧 CORRECCIÓN: Mostrar mensaje de estado de filtros
+    if filtros_aplicados_msg:
+        st.sidebar.info(" | ".join(filtros_aplicados_msg))
 
     # ---------- MÉTRICAS ----------
-    corte_hora = pd.Timestamp('1900-01-01 16:30:00').time()
-    total_antes_1630 = (df_filtrado['hora_creacion'] <= corte_hora).sum()
+    # 🔧 Usar constante global CORTE_HORA en lugar de variable local duplicada
+    total_antes_1630 = (df_filtrado['hora_creacion'] <= CORTE_HORA).sum()
     total_despues_1630 = len(df_filtrado) - total_antes_1630
 
     col1, col2, col3, col4 = st.columns(4)
@@ -574,6 +623,7 @@ if archivo_riders is not None:
         """
         Genera tabla de evolución agrupada por mes o semana.
         CORRECCIÓN: Filtra valores vacíos y ordena semanas numéricamente.
+        🔧 AGREGADO: Logging para depuración de valores no estándar
         """
         if col_agrupar not in df.columns:
             return None
@@ -603,6 +653,13 @@ if archivo_riders is not None:
         if col_agrupar == 'Semana Calendario':
             # Convertir a numérico para orden cronológico real (15, 16, 17, 18...)
             agg['_orden_temp'] = pd.to_numeric(agg[col_agrupar], errors='coerce')
+            
+            # 🔧 LOGGING: Registrar si hay valores no numéricos eliminados
+            filas_invalidas = agg['_orden_temp'].isna().sum()
+            if filas_invalidas > 0:
+                logger.warning(f"⚠️ {filas_invalidas} fila(s) con Semana Calendario no numérica fueron eliminadas")
+                st.warning(f"⚠️ {filas_invalidas} fila(s) con valores de Semana inválidos fueron excluidas del análisis. Verificá el formato de los datos.")
+            
             # Eliminar filas donde la conversión falló (valores no numéricos residuales)
             agg = agg[agg['_orden_temp'].notna()].copy()
             if agg.empty:
@@ -748,6 +805,13 @@ if archivo_riders is not None:
         # 🔹 Ordenamiento consistente por período
         if col_agrupar == 'Semana Calendario':
             agg['_orden_temp'] = pd.to_numeric(agg[col_agrupar], errors='coerce')
+            
+            # 🔧 LOGGING: Registrar si hay valores no numéricos eliminados
+            filas_invalidas = agg['_orden_temp'].isna().sum()
+            if filas_invalidas > 0:
+                logger.warning(f"⚠️ {filas_invalidas} fila(s) con Semana Calendario no numérica fueron eliminadas en ranking")
+                st.warning(f"⚠️ {filas_invalidas} fila(s) con valores de Semana inválidos fueron excluidas del ranking. Verificá el formato de los datos.")
+            
             agg = agg[agg['_orden_temp'].notna()]
             if agg.empty:
                 return
@@ -815,16 +879,24 @@ if archivo_riders is not None:
         )
 
     if 'Semana Calendario' in df_display.columns:
-        df_display['Semana Calendario'] = df_display['Semana Calendario'].apply(
-            lambda x: str(int(float(x))) if pd.notnull(x) and str(x).strip() != '' else ''
-        )    
+        # 🔧 Manejo robusto de Semana Calendario con logging de valores no estándar
+        def convertir_semana(x):
+            if pd.isna(x) or str(x).strip() == '':
+                return ''
+            try:
+                return str(int(float(x)))
+            except (ValueError, TypeError):
+                logger.warning(f"⚠️ Valor no estándar en Semana Calendario: {x}")
+                return str(x)  # Mantener valor original como string
+        
+        df_display['Semana Calendario'] = df_display['Semana Calendario'].apply(convertir_semana)    
 
     def colorear_detalle(row):
         if row['incumplimiento'] == True:
             return ['background-color: #ffe5e5'] * len(row)
         return [''] * len(row)
 
-    MAX_CELLS_STYLED = 262144
+    # Usar constante global MAX_CELLS_STYLED
     total_celdas = len(df_display) * len(df_display.columns)
 
     if total_celdas <= MAX_CELLS_STYLED:
